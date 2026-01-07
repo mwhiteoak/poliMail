@@ -32,7 +32,7 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Daily Property Briefing – $(date +'%d %b %Y')"
+          subject: "Daily News Update"
           to: ${{ secrets.EMAIL_TO }}
           from: "Property Briefing Bot <${{ secrets.EMAIL_USERNAME }}>"
           html_body: file://briefing.txt   # ← NOW SENDS AS HTML WITH CLICKABLE LINKS
