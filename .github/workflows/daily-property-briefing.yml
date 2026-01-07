@@ -33,7 +33,7 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Daily Political Briefing – Property Fund Insights – $(date +'%B %d, %Y')"
+          subject: "Daily News Briefing"
           to: ${{ secrets.EMAIL_TO }}
           from: "Property Briefing Bot <${{ secrets.EMAIL_USERNAME }}>"
           body: file://briefing.txt
