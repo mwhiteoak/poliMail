@@ -2,9 +2,8 @@ name: Daily Property Fund Political Briefing
 
 on:
   schedule:
-    # Runs daily at 6:00 AM AEST/AEDT (20:00 UTC previous day)
-    - cron: '0 20 * * *'
-  workflow_dispatch:  # Allows manual trigger for testing
+    - cron: '0 20 * * *'  # 6:00 AM Brisbane time daily
+  workflow_dispatch:
 
 jobs:
   generate-and-email:
@@ -26,19 +25,14 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: python get_news_summary.py > briefing.txt
 
-      - name: Send email
+      - name: Send HTML email
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Daily News Briefing"
+          subject: "Daily Property Briefing – $(date +'%d %b %Y')"
           to: ${{ secrets.EMAIL_TO }}
           from: "Property Briefing Bot <${{ secrets.EMAIL_USERNAME }}>"
-          body: file://briefing.txt
-          # Removed: content_type (not supported by this action)
-          # The action defaults to plain text when using 'body', which is what we want
-
-      - name: Capture date for subject (fallback if needed)
-        run: echo "date=$(date +'%B %d, %Y')" >> $GITHUB_OUTPUT
+          html_body: file://briefing.txt   # ← NOW SENDS AS HTML WITH CLICKABLE LINKS
