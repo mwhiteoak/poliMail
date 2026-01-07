@@ -1,0 +1,44 @@
+name: Daily Property Fund Political Briefing
+
+on:
+  schedule:
+    # Runs daily at 6:00 AM AEST/AEDT (which is 20:00 UTC the previous day)
+    - cron: '0 20 * * *'
+  workflow_dispatch:  # Allows manual trigger for testing
+
+jobs:
+  generate-and-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate briefing
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: python get_news_summary.py > briefing.txt
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Daily Political Briefing – Property Fund Insights – ${{ steps.date.outputs.date }}"
+          to: ${{ secrets.EMAIL_TO }}
+          from: "Property Briefing Bot <${{ secrets.EMAIL_USERNAME }}>"
+          body: file://briefing.txt
+          content_type: text/plain
+
+      - name: Set date for subject (optional fallback)
+        id: date
+        run: echo "date=$(date +'%B %d, %Y')" >> $GITHUB_OUTPUT
