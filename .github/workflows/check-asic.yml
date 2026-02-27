@@ -1,0 +1,30 @@
+name: ASIC Solar/Renewables Distress Monitor
+
+on:
+  schedule:
+    # Runs at 8:00 AM AEST (10:00 PM UTC previous day)
+    - cron: '0 22 * * *'
+  workflow_dispatch: # Allow manual trigger for testing
+
+jobs:
+  check-notices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Scrape ASIC and send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+        run: python scrape_asic.py
