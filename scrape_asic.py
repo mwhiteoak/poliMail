@@ -10,7 +10,7 @@ import re
 import smtplib
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -21,12 +21,24 @@ from bs4 import BeautifulSoup, Tag
 SEARCH_TERMS = ["solar", "renewable", "energy+storage", "battery+storage"]
 BASE_URL = "https://publishednotices.asic.gov.au/browsesearch-notices"
 NOTICE_BASE = "https://publishednotices.asic.gov.au"
-REQUEST_DELAY = 1.5  # seconds between detail page fetches (be polite)
+REQUEST_DELAY = 1.5  # seconds between detail page fetches
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
 }
+
+# Reuse a session for cookies (ASP.NET needs this)
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+
+def now_utc() -> datetime:
+    """Timezone-aware UTC now."""
+    return datetime.now(timezone.utc)
 
 
 def build_search_url(term: str) -> str:
@@ -51,32 +63,98 @@ def parse_date(date_str: str) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 def scrape_listing(search_term: str) -> list[dict]:
-    """Scrape page 1 of the ASIC search listing for a given term.
-    Returns lightweight notice stubs with date, notice_type, companies, and detail link.
-    """
+    """Scrape page 1 of the ASIC search listing for a given term."""
     url = build_search_url(search_term)
     print(f"[listing] Fetching: {url}")
 
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp = SESSION.get(url, timeout=30)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+
+    html = resp.text
+    print(f"  [debug] Response length: {len(html)} chars, status: {resp.status_code}")
+
+    # Debug: dump first 500 chars and check for key markers
+    if "article-block" not in html:
+        print(f"  [debug] WARNING: 'article-block' not found in response!")
+        print(f"  [debug] Checking for alternative markers...")
+        for marker in ["NoticeTable", "published-date", "notice-buttons", "title-block", 
+                        "search-results", "lvNoticeList", "<table", "<h3"]:
+            if marker in html:
+                print(f"  [debug]   Found: '{marker}'")
+
+        # Dump a snippet for debugging
+        # Find the <body> content
+        body_start = html.find("<body")
+        if body_start > -1:
+            snippet = html[body_start:body_start + 2000]
+            print(f"  [debug] Body snippet (first 2000 chars):")
+            print(snippet[:2000])
+        else:
+            print(f"  [debug] First 2000 chars of response:")
+            print(html[:2000])
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Try multiple selectors in case class names differ
+    blocks = soup.select("div.article-block")
+    if not blocks:
+        # Fallback: try finding by the published-date div
+        blocks = []
+        for date_div in soup.select("div.published-date"):
+            # Walk up to find the containing block
+            parent = date_div
+            for _ in range(5):
+                parent = parent.parent
+                if parent and parent.name == "div":
+                    blocks.append(parent)
+                    break
+                if parent and parent.name == "td":
+                    # The block might be inside a <td>
+                    inner_div = parent.find("div")
+                    if inner_div:
+                        blocks.append(inner_div)
+                    break
+
+    if not blocks:
+        # Last resort: try to find notice content by h3 tags with known notice text
+        print(f"  [debug] Trying h3-based fallback extraction...")
+        for h3 in soup.find_all("h3"):
+            text = h3.get_text(strip=True).upper()
+            if any(kw in text for kw in ["NOTICE OF", "APPLICATION FOR", "MEETING OF"]):
+                # Walk up to enclosing div or td
+                parent = h3.parent
+                for _ in range(5):
+                    if parent and parent.name in ("div", "td"):
+                        blocks.append(parent)
+                        break
+                    if parent:
+                        parent = parent.parent
+
+    print(f"  [debug] Found {len(blocks)} notice blocks")
 
     notices = []
-    for block in soup.select("div.article-block"):
+    for block in blocks:
         # Published date
-        date_el = block.select_one("div.published-date")
+        date_el = block.find("div", class_="published-date")
+        if not date_el:
+            # Fallback: look for "Published:" text anywhere in block
+            date_el = block.find(string=re.compile(r"Published:"))
+            if date_el:
+                date_el = date_el.parent
+
         if not date_el:
             continue
+
         date_text = date_el.get_text(strip=True).replace("Published:", "").strip()
         pub_date = parse_date(date_text)
         if not pub_date:
             continue
 
         # Notice type from h3
-        h3 = block.select_one("h3")
+        h3 = block.find("h3")
         notice_type = h3.get_text(" ", strip=True) if h3 else "Unknown"
 
-        # Quick company list from the listing (name + ACN + status)
+        # Company list from dl elements
         companies = []
         for dl in block.find_all("dl"):
             acn = status = ""
@@ -93,7 +171,6 @@ def scrape_listing(search_term: str) -> list[dict]:
             if not prev:
                 prev = dl.find_previous("p")
             name = prev.get_text(strip=True) if prev else ""
-            # Check for trading-as span
             trading_as = ""
             if prev:
                 ta_span = prev.find("span")
@@ -113,12 +190,16 @@ def scrape_listing(search_term: str) -> list[dict]:
 
         # Detail page link
         view_link = ""
-        link_tag = block.select_one("a.button")
+        link_tag = block.find("a", href=re.compile(r"notice-details"))
+        if not link_tag:
+            link_tag = block.select_one("a.button")
         if link_tag and link_tag.get("href"):
             href = link_tag["href"]
-            # Strip query params to get clean detail URL
             clean = href.split("?")[0]
-            view_link = NOTICE_BASE + clean
+            if clean.startswith("/"):
+                view_link = NOTICE_BASE + clean
+            elif clean.startswith("http"):
+                view_link = clean
 
         notices.append({
             "date": pub_date,
@@ -127,7 +208,7 @@ def scrape_listing(search_term: str) -> list[dict]:
             "companies": companies,
             "view_link": view_link,
             "search_term": search_term,
-            "detail": None,  # populated later
+            "detail": None,
         })
 
     return notices
@@ -157,7 +238,7 @@ def scrape_detail_page(url: str) -> dict:
     detail = {}
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp = SESSION.get(url, timeout=30)
         resp.raise_for_status()
     except Exception as e:
         print(f"  [detail] ERROR: {e}")
@@ -165,16 +246,16 @@ def scrape_detail_page(url: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # --- The notice content sits after the "## Notice" heading ---
+    # The notice content sits after the "Notice" h2 heading
     notice_heading = soup.find("h2", string=re.compile(r"^Notice$", re.I))
     if not notice_heading:
+        print(f"  [detail] WARNING: Could not find 'Notice' heading")
         return detail
 
-    # Gather all content after the Notice heading until footer
+    # Gather content elements until footer
     content_els = []
     for sib in notice_heading.find_next_siblings():
         if isinstance(sib, Tag):
-            # Stop at footer
             if sib.name == "ul" and sib.find("a", href="/about-us"):
                 break
             content_els.append(sib)
@@ -186,7 +267,7 @@ def scrape_detail_page(url: str) -> dict:
     all_kv = extract_table_pairs(content_soup)
     detail["all_fields"] = all_kv
 
-    # --- Map known fields ---
+    # Map known fields
     detail["company"] = all_kv.get("Company", "")
     detail["acn"] = all_kv.get("ACN", "")
     detail["status"] = all_kv.get("Status", "")
@@ -222,12 +303,12 @@ def scrape_detail_page(url: str) -> dict:
     detail["dividend_date"] = all_kv.get("Dividend Payable Date",
                                all_kv.get("Dividend payable date", ""))
 
-    # --- Notice title (the h2 inside the content) ---
+    # Notice title
     h2 = content_soup.find("h2")
     if h2:
         detail["notice_title"] = h2.get_text(" ", strip=True)
 
-    # --- Resolution / free text paragraphs ---
+    # Resolution / body text
     paragraphs = []
     for p in content_soup.find_all("p"):
         text = p.get_text(strip=True)
@@ -235,7 +316,7 @@ def scrape_detail_page(url: str) -> dict:
             paragraphs.append(text)
     detail["body_text"] = paragraphs
 
-    # --- Agenda / list items ---
+    # Agenda / list items
     list_items = []
     for li in content_soup.find_all("li"):
         text = li.get_text(strip=True)
@@ -243,12 +324,11 @@ def scrape_detail_page(url: str) -> dict:
             list_items.append(text)
     detail["agenda_items"] = list_items
 
-    # --- Special instructions ---
+    # Special instructions
     special = []
     for el in content_soup.find_all(string=re.compile(r"[Ss]pecial")):
         parent = el.find_parent()
         if parent:
-            # The text might be in the next sibling or in a following <p>
             next_el = parent.find_next_sibling()
             if next_el:
                 txt = next_el.get_text(strip=True)
@@ -256,7 +336,7 @@ def scrape_detail_page(url: str) -> dict:
                     special.append(txt)
     detail["special_instructions"] = " ".join(special) if special else ""
 
-    # --- Practitioner name from bold role text near bottom ---
+    # Practitioner name fallback (from bold role text near bottom)
     role_keywords = ("Liquidator", "Administrator", "Restructuring Practitioner",
                      "Provisional Liquidator", "Solicitor for the Applicant")
 
@@ -265,7 +345,6 @@ def scrape_detail_page(url: str) -> dict:
             text = strong.get_text(strip=True)
             if text in role_keywords:
                 detail["practitioner_role"] = text
-                # Name is usually in the <p> just before <p><strong>Role</strong></p>
                 parent_p = strong.find_parent("p")
                 if parent_p:
                     prev_p = parent_p.find_previous_sibling("p")
@@ -291,8 +370,10 @@ def scrape_detail_page(url: str) -> dict:
 
 def is_recent(notice: dict) -> bool:
     """Keep only notices from today or yesterday (AEST-aware with UTC buffer)."""
-    now = datetime.utcnow()
-    cutoff = (now - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+    now = now_utc()
+    cutoff = (now - timedelta(days=2)).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+    )
     return notice["date"] >= cutoff
 
 
@@ -312,7 +393,6 @@ def deduplicate(notices: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def fmt_field(label: str, value: str) -> str:
-    """Render a single label:value row for the detail table."""
     if not value:
         return ""
     return (
@@ -327,18 +407,17 @@ def build_notice_card(n: dict) -> str:
     """Build a styled HTML card for a single notice."""
     d = n.get("detail") or {}
 
-    # --- Status colour coding ---
     status_raw = d.get("status", "") or (n["companies"][0]["status"] if n["companies"] else "")
     if "Liquidation" in status_raw:
-        status_color, status_bg, badge = "#c0392b", "#fdecea", "🔴"
+        status_color, badge = "#c0392b", "🔴"
     elif "Administrator" in status_raw:
-        status_color, status_bg, badge = "#e67e22", "#fef5e7", "🟠"
+        status_color, badge = "#e67e22", "🟠"
     elif "Restructuring" in status_raw:
-        status_color, status_bg, badge = "#2980b9", "#eaf2f8", "🔵"
+        status_color, badge = "#2980b9", "🔵"
     else:
-        status_color, status_bg, badge = "#7f8c8d", "#f4f4f4", "⚪"
+        status_color, badge = "#7f8c8d", "⚪"
 
-    # --- Company rows ---
+    # Company rows
     company_html = ""
     for c in n["companies"]:
         ta = f' <span style="color:#888;font-size:12px;">(t/a {c["trading_as"]})</span>' if c.get("trading_as") else ""
@@ -349,35 +428,28 @@ def build_notice_card(n: dict) -> str:
             <span style="margin-left:8px;font-size:12px;color:{status_color};font-weight:bold;">{c['status']}</span>
         </div>"""
 
-    # --- Detail fields ---
+    # Detail fields
     fields = ""
     fields += fmt_field("Published", n["date_str"])
     fields += fmt_field("Appointment Date", d.get("appointment_date", ""))
     fields += fmt_field("Appointor", d.get("appointor", ""))
 
-    # Meeting
-    meeting_parts = filter(None, [d.get("meeting_date"), d.get("meeting_time")])
-    meeting_str = " at ".join(meeting_parts)
-    if meeting_str:
-        fields += fmt_field("Meeting", meeting_str)
+    meeting_parts = list(filter(None, [d.get("meeting_date"), d.get("meeting_time")]))
+    if meeting_parts:
+        fields += fmt_field("Meeting", " at ".join(meeting_parts))
     if d.get("meeting_location"):
         fields += fmt_field("Meeting Location", d["meeting_location"])
     if d.get("proof_of_debt_deadline"):
         fields += fmt_field("Proofs/Proxies Due", d["proof_of_debt_deadline"])
 
-    # Hearing
-    hearing_parts = filter(None, [d.get("hearing_date"), d.get("hearing_time")])
-    hearing_str = " at ".join(hearing_parts)
-    if hearing_str:
-        fields += fmt_field("Hearing", hearing_str)
+    hearing_parts = list(filter(None, [d.get("hearing_date"), d.get("hearing_time")]))
+    if hearing_parts:
+        fields += fmt_field("Hearing", " at ".join(hearing_parts))
     if d.get("court"):
         fields += fmt_field("Court", d["court"])
-
-    # Dividend
     if d.get("dividend_date"):
         fields += fmt_field("Dividend Payable", d["dividend_date"])
 
-    # Practitioner
     prac = d.get("practitioner_name", "")
     prac_role = d.get("practitioner_role", "")
     if prac:
@@ -395,14 +467,12 @@ def build_notice_card(n: dict) -> str:
 
     fields_table = f'<table style="margin-top:8px;border-collapse:collapse;">{fields}</table>' if fields else ""
 
-    # --- Body text (resolution, agenda) ---
+    # Body text
     body_html = ""
     body_texts = [t for t in d.get("body_text", []) if len(t) > 20]
-    # Show up to 3 paragraphs
     for t in body_texts[:3]:
         body_html += f'<p style="font-size:12px;color:#555;margin:4px 0;line-height:1.4;">{t}</p>'
 
-    # Agenda items
     agenda = d.get("agenda_items", [])
     if agenda:
         body_html += '<ul style="font-size:12px;color:#555;margin:4px 0;padding-left:18px;">'
@@ -410,7 +480,6 @@ def build_notice_card(n: dict) -> str:
             body_html += f'<li style="margin-bottom:2px;">{item}</li>'
         body_html += '</ul>'
 
-    # Special instructions
     if d.get("special_instructions"):
         body_html += (
             f'<div style="font-size:11px;color:#8e44ad;margin:8px 0;padding:6px 10px;'
@@ -419,7 +488,7 @@ def build_notice_card(n: dict) -> str:
             f'</div>'
         )
 
-    # --- Source link ---
+    # Source link
     link_html = ""
     if n["view_link"]:
         link_html = (
@@ -427,7 +496,6 @@ def build_notice_card(n: dict) -> str:
             f'text-decoration:none;font-weight:bold;">View full notice on ASIC →</a>'
         )
 
-    # --- Notice type ---
     notice_title = d.get("notice_title", n["notice_type"])
 
     return f"""
@@ -446,8 +514,7 @@ def build_notice_card(n: dict) -> str:
 
 
 def build_email(notices: list[dict]) -> str:
-    """Build the complete HTML email."""
-    today_str = datetime.utcnow().strftime("%A %d %B %Y")
+    today_str = now_utc().strftime("%A %d %B %Y")
 
     if not notices:
         return f"""
@@ -472,23 +539,19 @@ def build_email(notices: list[dict]) -> str:
     other = [n for n in notices if n not in liquidations and n not in administrations]
 
     cards_html = ""
-
     if liquidations:
         cards_html += '<h3 style="color:#c0392b;margin:24px 0 12px;">🔴 Liquidations</h3>'
         for n in liquidations:
             cards_html += build_notice_card(n)
-
     if administrations:
         cards_html += '<h3 style="color:#e67e22;margin:24px 0 12px;">🟠 Administrations</h3>'
         for n in administrations:
             cards_html += build_notice_card(n)
-
     if other:
         cards_html += '<h3 style="color:#2980b9;margin:24px 0 12px;">🔵 Other Notices</h3>'
         for n in other:
             cards_html += build_notice_card(n)
 
-    # Summary stats
     unique_companies = set()
     for n in notices:
         for c in n["companies"]:
@@ -516,7 +579,7 @@ def build_email(notices: list[dict]) -> str:
         <p style="font-size:11px;color:#999;">
             Search terms: {', '.join(t.replace('+', ' ') for t in SEARCH_TERMS)}<br>
             Source: <a href="{BASE_URL}" style="color:#999;">ASIC Published Notices</a><br>
-            Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+            Generated: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}
         </p>
     </body></html>"""
 
@@ -526,9 +589,19 @@ def build_email(notices: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def send_email(subject: str, html_body: str):
-    gmail_addr = os.environ["GMAIL_ADDRESS"]
-    gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
+    gmail_addr = os.environ.get("GMAIL_ADDRESS", "")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
     notify_email = os.environ.get("NOTIFY_EMAIL", gmail_addr)
+
+    if not gmail_addr or not gmail_pass:
+        print("⚠️  GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — skipping email")
+        print("    Set these as GitHub Secrets to enable email delivery")
+        return
+
+    # Strip whitespace/newlines that can sneak into secrets
+    gmail_addr = gmail_addr.strip()
+    gmail_pass = gmail_pass.strip()
+    notify_email = notify_email.strip()
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -536,11 +609,25 @@ def send_email(subject: str, html_body: str):
     msg["To"] = notify_email
     msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(gmail_addr, gmail_pass)
-        server.sendmail(gmail_addr, [notify_email], msg.as_string())
-
-    print(f"✉️  Email sent to {notify_email}")
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_addr, gmail_pass)
+            server.sendmail(gmail_addr, [notify_email], msg.as_string())
+        print(f"✉️  Email sent to {notify_email}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"\n❌ Gmail authentication failed!")
+        print(f"   Error: {e}")
+        print(f"\n   Common fixes:")
+        print(f"   1. Make sure you're using an App Password, NOT your regular password")
+        print(f"   2. Go to https://myaccount.google.com/apppasswords to create one")
+        print(f"   3. You MUST have 2-Step Verification enabled first")
+        print(f"   4. The App Password is 16 chars with no spaces (e.g. 'abcdefghijklmnop')")
+        print(f"   5. Check your GMAIL_APP_PASSWORD secret has no leading/trailing spaces")
+        print(f"   6. GMAIL_ADDRESS should be your full email (e.g. 'you@gmail.com')")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Failed to send email: {e}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -550,9 +637,9 @@ def send_email(subject: str, html_body: str):
 def main():
     all_notices = []
 
-    # Step 1: Scrape all search term listings
     print("=" * 60)
     print("ASIC Distress Monitor — Starting scrape")
+    print(f"Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
 
     for term in SEARCH_TERMS:
@@ -563,15 +650,15 @@ def main():
         except Exception as e:
             print(f"  ✗ Error scraping '{term}': {e}")
 
-    # Deduplicate across search terms
+    # Deduplicate
     all_notices = deduplicate(all_notices)
     print(f"\n{len(all_notices)} unique notices total (all dates)")
 
-    # Filter to recent only
+    # Filter to recent
     recent = [n for n in all_notices if is_recent(n)]
     print(f"{len(recent)} notices from today/yesterday\n")
 
-    # Step 2: Fetch detail page for each recent notice
+    # Fetch detail pages
     if recent:
         print("Fetching detail pages...")
         for i, notice in enumerate(recent):
@@ -583,8 +670,8 @@ def main():
                 notice["detail"] = {}
         print()
 
-    # Step 3: Build and send email
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    # Build and send email
+    today_str = now_utc().strftime("%Y-%m-%d")
     subject = f"ASIC Solar/Renewables Monitor — {today_str}"
     if recent:
         subject += f" — {len(recent)} notice(s)"
