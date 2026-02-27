@@ -19,7 +19,22 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 from bs4 import BeautifulSoup, Tag
 
 # --- Configuration ---
-SEARCH_TERMS = ["solar", "renewable", "energy+storage", "battery+storage"]
+SEARCH_TERMS = [
+    "solar",
+    "renewable",
+    "photovoltaic",
+    "battery",
+    "wind+energy",
+    "wind+farm",
+    "energy+storage",
+    "green+energy",
+    "clean+energy",
+    "hydrogen",
+    "EV+charging",
+    "electric+vehicle",
+    "inverter",
+    "geothermal",
+]
 BASE_URL = "https://publishednotices.asic.gov.au/browsesearch-notices"
 NOTICE_BASE = "https://publishednotices.asic.gov.au"
 DETAIL_DELAY = 2  # seconds between detail page loads
@@ -378,14 +393,52 @@ def build_notice_card(n):
 
     lh = f'<a href="{n["view_link"]}" style="font-size:12px;color:#2980b9;text-decoration:none;font-weight:bold;">View full notice on ASIC →</a>' if n["view_link"] else ""
     nt = d.get("notice_title", n["notice_type"])
+    st = n.get("search_term", "").replace("+", " ")
+    st_tag = f' <span style="font-size:10px;color:#fff;background:{sc};padding:1px 6px;border-radius:3px;text-transform:none;letter-spacing:0;font-weight:normal;">matched: {st}</span>' if st else ""
 
-    return f'<div style="border:1px solid #e0e0e0;border-left:4px solid {sc};border-radius:6px;padding:16px;margin-bottom:16px;background:white;"><div style="font-size:11px;color:{sc};font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">{bg} {nt}</div>{ch}{ft}{bh}<div style="margin-top:12px;padding-top:8px;border-top:1px solid #f0f0f0;">{lh}</div></div>'
+    return f'<div style="border:1px solid #e0e0e0;border-left:4px solid {sc};border-radius:6px;padding:16px;margin-bottom:16px;background:white;"><div style="font-size:11px;color:{sc};font-weight:bold;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;">{bg} {nt}{st_tag}</div>{ch}{ft}{bh}<div style="margin-top:12px;padding-top:8px;border-top:1px solid #f0f0f0;">{lh}</div></div>'
+
+
+def build_search_links_html(matched_terms: set = None) -> str:
+    """Build clickable search term pills. Highlight the ones that returned results."""
+    pills = []
+    for t in SEARCH_TERMS:
+        label = t.replace("+", " ")
+        url = build_search_url(t)
+        is_matched = matched_terms and t in matched_terms
+        if is_matched:
+            style = "display:inline-block;margin:2px 4px 2px 0;padding:3px 8px;border-radius:4px;font-size:11px;text-decoration:none;background:#2ecc71;color:#fff;font-weight:bold;"
+        else:
+            style = "display:inline-block;margin:2px 4px 2px 0;padding:3px 8px;border-radius:4px;font-size:11px;text-decoration:none;background:#ecf0f1;color:#666;"
+        pills.append(f'<a href="{url}" style="{style}">{label}</a>')
+    return " ".join(pills)
 
 
 def build_email(notices):
     ts = now_utc().strftime("%A %d %B %Y")
+    matched = set(n.get("search_term", "") for n in notices) if notices else set()
+    search_section = (
+        f'<div style="margin:16px 0;padding:12px 16px;background:#f8f9fa;border-radius:6px;">'
+        f'<div style="font-size:12px;color:#555;margin-bottom:6px;font-weight:bold;">Search terms monitored ({len(SEARCH_TERMS)}):</div>'
+        f'<div>{build_search_links_html(matched)}</div>'
+        f'<div style="font-size:10px;color:#999;margin-top:6px;">🟢 = returned results today &nbsp;|&nbsp; Click any term to view on ASIC</div>'
+        f'</div>'
+    )
+
     if not notices:
-        return f'<html><body style="font-family:-apple-system,Arial,sans-serif;color:#333;max-width:700px;margin:0 auto;padding:20px;"><h2 style="color:#2c3e50;">⚡ ASIC Distress Monitor</h2><p style="color:#666;">{ts}</p><div style="background:#f0f9f0;border:1px solid #c3e6cb;border-radius:6px;padding:16px;margin:20px 0;"><p style="color:#155724;margin:0;">✅ No new solar/renewable insolvency notices found today.</p></div><p style="font-size:11px;color:#999;">Search terms: {", ".join(t.replace("+", " ") for t in SEARCH_TERMS)}<br>Source: <a href="{BASE_URL}" style="color:#999;">ASIC Published Notices</a></p></body></html>'
+        return (
+            f'<html><body style="font-family:-apple-system,Arial,sans-serif;color:#333;max-width:700px;margin:0 auto;padding:20px;">'
+            f'<h2 style="color:#2c3e50;">⚡ ASIC Distress Monitor</h2>'
+            f'<p style="color:#666;">{ts}</p>'
+            f'<div style="background:#f0f9f0;border:1px solid #c3e6cb;border-radius:6px;padding:16px;margin:20px 0;">'
+            f'<p style="color:#155724;margin:0;">✅ No new solar/renewable insolvency notices found today.</p>'
+            f'</div>'
+            f'{search_section}'
+            f'<hr style="border:none;border-top:1px solid #eee;margin:24px 0;">'
+            f'<p style="font-size:11px;color:#999;">Source: <a href="{BASE_URL}" style="color:#999;">ASIC Published Notices</a><br>'
+            f'Generated: {now_utc().strftime("%Y-%m-%d %H:%M UTC")}</p>'
+            f'</body></html>'
+        )
 
     lq = [n for n in notices if any("Liquidation" in c.get("status","") for c in n["companies"])]
     ad = [n for n in notices if any("Administrator" in c.get("status","") for c in n["companies"])]
@@ -396,7 +449,21 @@ def build_email(notices):
     if ot: cards += '<h3 style="color:#2980b9;margin:24px 0 12px;">🔵 Other Notices</h3>' + "".join(build_notice_card(n) for n in ot)
     uc = set(c["acn"] for n in notices for c in n["companies"] if c.get("acn"))
 
-    return f'<html><body style="font-family:-apple-system,Arial,sans-serif;color:#333;max-width:700px;margin:0 auto;padding:20px;"><h2 style="color:#2c3e50;margin-bottom:4px;">⚡ ASIC Distress Monitor — Daily Report</h2><p style="color:#666;margin-top:0;">{ts}</p><div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;margin-bottom:20px;"><strong>{len(notices)}</strong> notice(s) across <strong>{len(uc)}</strong> unique compan{"y" if len(uc)==1 else "ies"} | 🔴 {len(lq)} liquidation 🟠 {len(ad)} administration 🔵 {len(ot)} other</div>{cards}<hr style="border:none;border-top:1px solid #eee;margin:24px 0;"><p style="font-size:11px;color:#999;">Search terms: {", ".join(t.replace("+", " ") for t in SEARCH_TERMS)}<br>Source: <a href="{BASE_URL}" style="color:#999;">ASIC Published Notices</a><br>Generated: {now_utc().strftime("%Y-%m-%d %H:%M UTC")}</p></body></html>'
+    return (
+        f'<html><body style="font-family:-apple-system,Arial,sans-serif;color:#333;max-width:700px;margin:0 auto;padding:20px;">'
+        f'<h2 style="color:#2c3e50;margin-bottom:4px;">⚡ ASIC Distress Monitor — Daily Report</h2>'
+        f'<p style="color:#666;margin-top:0;">{ts}</p>'
+        f'<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;margin-bottom:20px;">'
+        f'<strong>{len(notices)}</strong> notice(s) across '
+        f'<strong>{len(uc)}</strong> unique compan{"y" if len(uc)==1 else "ies"} | '
+        f'🔴 {len(lq)} liquidation 🟠 {len(ad)} administration 🔵 {len(ot)} other</div>'
+        f'{cards}'
+        f'{search_section}'
+        f'<hr style="border:none;border-top:1px solid #eee;margin:24px 0;">'
+        f'<p style="font-size:11px;color:#999;">Source: <a href="{BASE_URL}" style="color:#999;">ASIC Published Notices</a><br>'
+        f'Generated: {now_utc().strftime("%Y-%m-%d %H:%M UTC")}</p>'
+        f'</body></html>'
+    )
 
 
 # ---------------------------------------------------------------------------
