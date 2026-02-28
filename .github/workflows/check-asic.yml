@@ -2,7 +2,7 @@ name: ASIC Solar/Renewables Distress Monitor
 
 on:
   schedule:
-    # Runs at 8:00 AM AEST (10:00 PM UTC previous day)
+    # Daily at 8:00 AM AEST (10:00 PM UTC previous day)
     - cron: '0 22 * * *'
   workflow_dispatch: # Allow manual trigger for testing
 
@@ -56,3 +56,11 @@ jobs:
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           PYTHONUNBUFFERED: "1"
         run: python scrape_asic.py
+
+      - name: Save seen notices
+        run: |
+          git config user.name "ASIC Monitor Bot"
+          git config user.email "bot@github-actions"
+          git add seen_notices.json
+          git diff --cached --quiet || git commit -m "Update seen notices [skip ci]"
+          git push
