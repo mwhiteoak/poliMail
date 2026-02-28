@@ -6,6 +6,7 @@ The WAF serves a JS challenge that gets a token, then reloads the page.
 We must wait for that reload cycle to complete before scraping.
 """
 
+import json
 import os
 import re
 import smtplib
@@ -14,6 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 from bs4 import BeautifulSoup, Tag
@@ -38,10 +40,37 @@ SEARCH_TERMS = [
 BASE_URL = "https://publishednotices.asic.gov.au/browsesearch-notices"
 NOTICE_BASE = "https://publishednotices.asic.gov.au"
 DETAIL_DELAY = 2  # seconds between detail page loads
+SEEN_FILE = Path(__file__).parent / "seen_notices.json"
+SEEN_MAX_AGE_DAYS = 30  # purge entries older than this
 
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def load_seen() -> dict:
+    """Load seen notices. Format: {"url_or_key": "2026-03-01T05:00:00Z", ...}"""
+    if SEEN_FILE.exists():
+        try:
+            data = json.loads(SEEN_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_seen(seen: dict):
+    """Save seen notices, purging entries older than SEEN_MAX_AGE_DAYS."""
+    cutoff = (now_utc() - timedelta(days=SEEN_MAX_AGE_DAYS)).isoformat()
+    pruned = {k: v for k, v in seen.items() if v >= cutoff}
+    SEEN_FILE.write_text(json.dumps(pruned, indent=2))
+    print(f"  [seen] Saved {len(pruned)} entries ({len(seen) - len(pruned)} pruned)")
+
+
+def notice_key(n: dict) -> str:
+    """Unique key for a notice."""
+    return n["view_link"] or f"{n['date_str']}|{n['notice_type']}|{'|'.join(c['acn'] for c in n['companies'])}"
 
 
 def build_search_url(term: str) -> str:
@@ -334,7 +363,7 @@ def scrape_detail_page(page, url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def is_recent(notice):
-    cutoff = (now_utc() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    cutoff = (now_utc() - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     return notice["date"] >= cutoff
 
 def deduplicate(notices):
@@ -500,6 +529,10 @@ def main():
     print(f"Time: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
 
+    # Load previously seen notices
+    seen = load_seen()
+    print(f"[seen] {len(seen)} previously seen notices loaded")
+
     all_notices = []
 
     with sync_playwright() as pw:
@@ -516,7 +549,6 @@ def main():
         print("\n[init] Loading ASIC homepage to establish WAF session...")
         try:
             page.goto("https://publishednotices.asic.gov.au/", wait_until="load", timeout=30000)
-            # Wait for WAF challenge to resolve
             for i in range(8):
                 page.wait_for_timeout(2000)
                 content = page.content()
@@ -540,16 +572,21 @@ def main():
         all_notices = deduplicate(all_notices)
         print(f"\n{len(all_notices)} unique notices total (all dates)")
 
+        # Filter to recent (last 7 days to cast a wider net, then dedupe via seen)
         recent = [n for n in all_notices if is_recent(n)]
-        print(f"{len(recent)} notices from today/yesterday\n")
+        print(f"{len(recent)} notices from last 7 days")
 
-        # Fetch detail pages
-        if recent:
+        # Filter out already-seen notices
+        new_notices = [n for n in recent if notice_key(n) not in seen]
+        print(f"{len(new_notices)} NEW notices (not previously sent)\n")
+
+        # Fetch detail pages for new notices only
+        if new_notices:
             print("Fetching detail pages...")
-            for i, notice in enumerate(recent):
+            for i, notice in enumerate(new_notices):
                 if notice["view_link"]:
                     notice["detail"] = scrape_detail_page(page, notice["view_link"])
-                    if i < len(recent) - 1:
+                    if i < len(new_notices) - 1:
                         time.sleep(DETAIL_DELAY)
                 else:
                     notice["detail"] = {}
@@ -557,11 +594,20 @@ def main():
 
         browser.close()
 
+    # Mark all recent notices as seen (even if already seen, refreshes timestamp)
+    ts_now = now_utc().isoformat()
+    for n in recent:
+        seen[notice_key(n)] = ts_now
+    save_seen(seen)
+
     # Send email
     ts = now_utc().strftime("%Y-%m-%d")
     subj = f"ASIC Solar/Renewables Monitor — {ts}"
-    subj += f" — {len(recent)} notice(s)" if recent else " — no new notices"
-    send_email(subj, build_email(recent))
+    if new_notices:
+        subj += f" — {len(new_notices)} NEW notice(s)"
+    else:
+        subj += " — no new notices"
+    send_email(subj, build_email(new_notices))
 
     print("=" * 60)
     print("✅ Done!")
